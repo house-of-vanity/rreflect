@@ -1,0 +1,13 @@
+[package]
+name = "rreflect"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossbeam = "0.8.2"
+crossbeam-utils = "0.8.15"
+threadpool = "1.8.1"
+ureq = "2.6.2"
+url = "2.3.1"
