@@ -1,137 +1,86 @@
-use crossbeam_utils::thread;
+#[macro_use]
+extern crate log;
+
+#[macro_use]
+extern crate ureq;
+
+use arch_mirrors::country::Kind::{Germany, Serbia, Sweden, Turkey};
+use log::{debug, info, trace, warn};
+use reqwest::{Client, Response};
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::copy;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use threadpool::ThreadPool;
-use url::{ParseError, Url};
+use tokio::task;
+use tokio::task::spawn_blocking;
+use std::io::Read;
 
-use crate::structs::Mirrorlist;
-mod structs;
 
-const SKIP_LINES: &'static [&'static str] = &["Arch Linux repository mirrorlist", "Generated on"];
-
-fn main() -> Result<(), ureq::Error> {
-    let mut mirrorlist: Mirrorlist = Mirrorlist {
-        country: Default::default(),
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+    let status = match arch_mirrors::get_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("error: {}", error);
+            panic!("Couldn't fetch mirrors")
+        }
     };
 
-    mirrorlist.country.insert("Default".to_string(), vec![]);
+    let mut res: HashMap<String, u128> = HashMap::new();
+    for url in status.urls {
+        if !url.url.scheme().contains("rsync") {
+            if url.country.kind == Sweden {
+                let _url = url.url.clone();
+                let speed = spawn_blocking(move || {
+                    println!("{}community/os/x86_64/community.db", _url);
+                    let start = Instant::now();
 
-    let body: String = ureq::get("https://archlinux.org/mirrorlist/?country=AT&protocol=http&protocol=https&ip_version=4")
-        .call()?
-        .into_string()?;
+                    let resp = ureq::get(format!("{}community/os/x86_64/community.db", _url).as_str()).call().unwrap();
 
-    let mut current_country: &str = "";
-    'line: for line in body.lines() {
-        if line.starts_with("## ") {
-            for s in SKIP_LINES.iter() {
-                if line.contains(s) {
-                    continue 'line;
-                }
+                    let len: usize = resp.header("Content-Length").unwrap().parse().unwrap_or(0);
+
+                    let mut bytes: Vec<u8> = Vec::with_capacity(len);
+                    resp.into_reader()
+                        .take(10_000_000)
+                        .read_to_end(&mut bytes).unwrap();
+
+                    // let x = ureq::get(format!("{}community/os/x86_64/community.db", _url).as_str())
+                    //     .call()
+                    //     .unwrap()
+                    //     .into_string()
+                    //     .unwrap_or("".to_string());
+                    let millis = start.elapsed().as_millis();
+                    println!("{} / {}", len, millis);
+                    (len as u128 / millis * 1000  / 1024 / 1024) as u128
+                })
+                .await
+                .unwrap();
+
+                //println!("{} - {}", url.url.to_string(), speed);
+                res.insert(url.url.to_string(), speed);
+                println!(
+                    "## {} - {} Mbit/s",
+                    url.url.host_str().unwrap_or("None"),
+                    speed as u128
+                );
             }
-            match line.get(3..) {
-                Some(country) => {
-                    mirrorlist.country.insert(country.to_string(), vec![]);
-                    current_country = country;
-                }
-                _ => {
-                    continue 'line;
-                }
-            };
-        } else if line.starts_with("#Server = ") {
-            match mirrorlist.country.get_mut(current_country) {
-                None => {}
-                Some(country) => {
-                    match line.get(10..) {
-                        Some(url) => {
-                            country.push(url.to_string());
-                        }
-                        _ => {
-                            continue 'line;
-                        }
-                    };
-                }
-            };
-        }
+        };
     }
-    //println!("{:?}", mirrorlist);
-    let mut urls: Vec<String> = vec![];
-
-    for country in &mirrorlist.country {
-        println!("{:?}!", country.0);
-        thread::scope(|s| {
-            for url in country.1 {
-                s.spawn(move |_| {
-                    //println!("{:?}!", url);
-                    match Url::parse(url.as_str()) {
-                        Ok(p) => {
-                            let start = Instant::now();
-                            match ureq::get(
-                                format!("{}://{}", p.scheme(), p.host_str().unwrap()).as_str(),
-                            )
-                                .timeout(Duration::from_secs(1))
-                                .call()
-                            {
-                                Ok(body) => {
-                                    let duration = start.elapsed();
-                                    &urls.push(body.into_string().unwrap());
-                                    println!("{} {} takes {:?}", url, p.host_str().unwrap(), duration);
-                                }
-                                Err(_) => {}
-                            };
-
-
-                        },
-                        Err(e) => {
-                            unimplemented!()
-                        }
-                    }
-                });
-            }
-        })
-        .unwrap();
+    let mut hash_vec: Vec<(&String, &u128)> = res.iter().collect();
+    hash_vec.sort_by(|a, b| b.1.cmp(a.1));
+    println!(
+        r#"##
+## Arch Linux repository mirrorlist
+## Created by arch_mirrors
+## Generated on {}
+##
+"#,
+        chrono::Utc::now().date_naive()
+    );
+    for i in hash_vec {
+        println!("# {}", i.1);
+        println!("Server = {}$repo/os/$arch", i.0)
     }
-
-    /*
-       let server_list: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-       let pool = ThreadPool::new(100);
-
-       for (country, urls) in mirrorlist.country {
-
-           let server_list = Arc::clone(&server_list);
-
-           pool.execute(move || {
-               println!("THREAD");
-               for server in urls {
-
-                   match Url::parse(server.as_str()) {
-                       Ok(p) => {
-                           let start = Instant::now();
-                           match ureq::get(
-                               format!("{}://{}", p.scheme(), p.host_str().unwrap()).as_str(),
-                           )
-                           .timeout(Duration::from_secs(1))
-                           .call()
-                           {
-                               Ok(_) => {
-                                   let mut server_list = server_list.lock().unwrap();
-                                   server_list.push(server.clone())
-                               },
-                               Err(e) => {
-                                   println!("{:?}", e)
-                               }
-                           };
-                           let duration = start.elapsed();
-                           //println!("{} {} takes {:?}", country, p.host_str().unwrap(), duration)
-                       }
-                       Err(_) => {}
-                   };
-               }
-           });
-           pool.join()
-       };
-
-       println!("Server = {:?}", server_list.lock().unwrap());
-
-    */
-    Ok(())
 }
